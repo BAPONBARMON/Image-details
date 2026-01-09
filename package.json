@@ -1,16 +1,14 @@
 {
-  "name": "image-detail-extractor-backend",
+  "name": "image-details",
   "version": "1.0.0",
-  "description": "Accurate image metadata & analysis backend",
-  "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^4.18.2",
-    "multer": "^1.4.5-lts.1",
-    "exif-parser": "^0.1.12",
-    "sharp": "^0.33.2",
-    "cors": "^2.8.5"
+    "multer": "^1.4.5",
+    "exiftool-vendored": "^23.5.0"
   }
 }
