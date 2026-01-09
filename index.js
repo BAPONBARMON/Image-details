@@ -1,115 +1,177 @@
-const express = require("express");
-const multer = require("multer");
-const fs = require("fs");
-const exifParser = require("exif-parser");
-const sharp = require("sharp");
-const cors = require("cors");
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import fs from "fs";
+import { exiftool } from "exiftool-vendored";
 
 const app = express();
-app.use(cors());
-
-/* multer setup */
 const upload = multer({ dest: "uploads/" });
 
-/* home check */
-app.get("/", (req, res) => {
-  res.send("Image Detail Extractor Backend Running");
-});
+app.use(cors());
+app.use(express.json());
 
-/* helpers */
-function isValidValue(v){
-  if(v === null || v === undefined) return false;
-  if(typeof v === "number" && v < 1000000000) return false; // block 1970
-  if(typeof v === "string" && v.trim() === "") return false;
-  if(typeof v === "string" && v.includes("0000:00:00")) return false;
-  return true;
+/* ---------- helper functions ---------- */
+
+function formatAMPM(date) {
+  return date.toLocaleString("en-US", { hour12: true });
 }
 
-/* upload route */
+function parseCaptureTime(exif) {
+  // priority order (industry standard)
+  const candidates = [
+    exif.SubSecDateTimeOriginal,
+    exif.DateTimeOriginal,
+    exif.CreateDate,
+    exif.GPSDateTime
+  ];
+
+  for (const val of candidates) {
+    if (!val) continue;
+
+    // UNIX timestamp
+    if (typeof val === "number") {
+      return formatAMPM(new Date(val * 1000));
+    }
+
+    // exif date string: 2026:01:09 21:17:55
+    if (typeof val === "string" && val.includes(" ")) {
+      const [d, t] = val.split(" ");
+      const iso = d.replace(/:/g, "-") + "T" + t.replace("Z", "");
+      const dt = new Date(iso);
+      if (!isNaN(dt)) return formatAMPM(dt);
+    }
+  }
+  return null;
+}
+
+function dmsToDecimal(dms, ref) {
+  if (!Array.isArray(dms) || dms.length < 3) return null;
+  let dec = dms[0] + dms[1] / 60 + dms[2] / 3600;
+  if (ref === "S" || ref === "W") dec *= -1;
+  return Number(dec.toFixed(6));
+}
+
+function dmsPretty(dms, ref) {
+  if (!Array.isArray(dms) || dms.length < 3) return null;
+  return `${dms[0]}° ${dms[1]}' ${dms[2]}" ${ref}`;
+}
+
+/* ---------- routes ---------- */
+
+app.get("/", (req, res) => {
+  res.send("Backend OK");
+});
+
 app.post("/upload", upload.single("image"), async (req, res) => {
+  const filePath = req.file.path;
+
   try {
-    const filePath = req.file.path;
-    const buffer = fs.readFileSync(filePath);
+    const exif = await exiftool.read(filePath);
 
-    /* ===== EXIF ===== */
-    let exifData = {};
-    try {
-      const parser = exifParser.create(buffer);
-      const exif = parser.parse();
-      for (let key in exif.tags) {
-        if (isValidValue(exif.tags[key])) {
-          exifData[key] = exif.tags[key];
-        }
+    /* ---------- CLEAN DATA ---------- */
+    const clean = {};
+
+    // Capture time
+    const captured = parseCaptureTime(exif);
+    if (captured) clean.CapturedTime = captured;
+
+    // GPS
+    if (exif.GPSLatitude && exif.GPSLatitudeRef) {
+      clean.Latitude_DMS = dmsPretty(
+        exif.GPSLatitude,
+        exif.GPSLatitudeRef
+      );
+      clean.Latitude_Decimal = dmsToDecimal(
+        exif.GPSLatitude,
+        exif.GPSLatitudeRef
+      );
+    }
+
+    if (exif.GPSLongitude && exif.GPSLongitudeRef) {
+      clean.Longitude_DMS = dmsPretty(
+        exif.GPSLongitude,
+        exif.GPSLongitudeRef
+      );
+      clean.Longitude_Decimal = dmsToDecimal(
+        exif.GPSLongitude,
+        exif.GPSLongitudeRef
+      );
+    }
+
+    if (clean.Latitude_DMS && clean.Longitude_DMS) {
+      clean.GPSPosition = `${clean.Latitude_DMS}, ${clean.Longitude_DMS}`;
+    }
+
+    // Camera / device
+    if (exif.Make) clean.Make = exif.Make;
+    if (exif.Model) clean.Model = exif.Model;
+    if (exif.LensModel) clean.Lens = exif.LensModel;
+
+    // Image
+    if (exif.ImageWidth) clean.ImageWidth = exif.ImageWidth;
+    if (exif.ImageHeight) clean.ImageHeight = exif.ImageHeight;
+    if (exif.Megapixels) clean.Megapixels = exif.Megapixels;
+    if (exif.MIMEType) clean.MIMEType = exif.MIMEType;
+
+    // File
+    clean.FileName = req.file.originalname;
+    clean.FileSizeMB = (req.file.size / (1024 * 1024)).toFixed(2);
+
+    /* ---------- ANALYSIS (SAFE ONLY) ---------- */
+    const analysis = {};
+    if (exif.ISO) analysis.ISO = exif.ISO;
+    if (exif.FNumber) analysis.Aperture = exif.FNumber;
+    if (exif.ExposureTime) analysis.ExposureTime = exif.ExposureTime;
+    if (exif.WhiteBalance) analysis.WhiteBalance = exif.WhiteBalance;
+    if (exif.MeteringMode) analysis.MeteringMode = exif.MeteringMode;
+
+    /* ---------- RAW (EVERYTHING ELSE) ---------- */
+    const usedKeys = new Set([
+      ...Object.keys(clean),
+      "SubSecDateTimeOriginal",
+      "DateTimeOriginal",
+      "CreateDate",
+      "GPSDateTime",
+      "GPSLatitude",
+      "GPSLatitudeRef",
+      "GPSLongitude",
+      "GPSLongitudeRef",
+      "Make",
+      "Model",
+      "LensModel",
+      "ImageWidth",
+      "ImageHeight",
+      "Megapixels",
+      "MIMEType",
+      "ISO",
+      "FNumber",
+      "ExposureTime",
+      "WhiteBalance",
+      "MeteringMode"
+    ]);
+
+    const raw = {};
+    for (const k in exif) {
+      if (!usedKeys.has(k)) {
+        raw[k] = exif[k];
       }
-    } catch (e) {
-      exifData = {};
     }
 
-    /* ===== IMAGE STRUCTURE ===== */
-    const image = sharp(buffer);
-    const meta = await image.metadata();
-
-    const imageInfo = {
-      width: meta.width || null,
-      height: meta.height || null,
-      format: meta.format || null,
-      space: meta.space || null,
-      channels: meta.channels || null,
-      depth: meta.depth || null,
-      density: meta.density || null
-    };
-
-    /* ===== BASIC ANALYSIS (pixel based) ===== */
-    let analysis = {};
-    try {
-      const stats = await image.stats();
-      analysis = {
-        brightness:
-          stats.channels[0].mean < 60
-            ? "Low"
-            : stats.channels[0].mean > 180
-            ? "High"
-            : "Normal",
-        contrast:
-          stats.channels[0].stdev < 20
-            ? "Low"
-            : stats.channels[0].stdev > 80
-            ? "High"
-            : "Normal"
-      };
-    } catch {
-      analysis = {};
-    }
-
-    /* ===== RESPONSE ===== */
     res.json({
-      file: {
-        name: req.file.originalname,
-        sizeKB: (req.file.size / 1024).toFixed(2),
-        mime: req.file.mimetype
-      },
-      image: imageInfo,
-      exif: exifData,
-      analysis: analysis,
-      note:
-        Object.keys(exifData).length === 0
-          ? "Metadata missing or stripped (e.g., WhatsApp image)"
-          : "Metadata extracted from image"
+      clean,
+      analysis,
+      raw
     });
-
-    /* cleanup */
-    fs.unlinkSync(filePath);
-
   } catch (err) {
-    res.status(500).json({
-      error: "Image processing failed",
-      details: err.message
-    });
+    res.status(500).json({ error: err.message });
+  } finally {
+    fs.unlinkSync(filePath);
   }
 });
 
-/* server start */
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log("Server running on port", PORT);
-});
+/* ---------- shutdown ---------- */
+process.on("exit", () => exiftool.end());
+
+app.listen(10000, () =>
+  console.log("Server running on port 10000")
+);
